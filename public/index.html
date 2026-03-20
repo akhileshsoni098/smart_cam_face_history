@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>RT Face Attendance — Backend Verified</title>
+
+    <!-- face-api (local) -->
+    <script src="/js/face-api.min.js"></script>
+    <!-- socket.io -->
+    <script src="/socket.io/socket.io.js"></script>
+
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      body {
+        font-family: Arial, Helvetica, sans-serif;
+        padding: 12px;
+      }
+      .camera-wrap {
+        position: relative;
+        width: 720px;
+      }
+      video {
+        width: 720px;
+        height: 540px;
+        border: 1px solid #333;
+        background: #000;
+        display: block;
+      }
+      canvas#overlay {
+        position: absolute;
+        left: 0;
+        top: 0;
+        pointer-events: none;
+      }
+      #status {
+        margin-top: 8px;
+        padding: 6px;
+        background: #f3f3f3;
+        display: inline-block;
+      }
+      #log {
+        margin-top: 12px;
+        max-width: 720px;
+        white-space: pre-wrap;
+        font-size: 13px;
+        color: #222;
+      }
+      .small {
+        font-size: 12px;
+        color: #666;
+        margin-left: 8px;
+      }
+
+      #toast {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        min-width: 220px;
+        padding: 10px 14px;
+        border-radius: 8px;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.15);
+        background: #111;
+        color: #fff;
+        opacity: 0;
+        transform: translateY(12px);
+        transition:
+          opacity 0.25s ease,
+          transform 0.25s ease;
+        pointer-events: none;
+        z-index: 9999;
+        font-size: 14px;
+      }
+      #toast.show {
+        opacity: 1;
+        transform: translateY(0);
+        pointer-events: auto;
+      }
+      #toast.success {
+        background: #1b7a3a;
+      }
+      #toast.info {
+        background: #1565c0;
+      }
+      #toast.warn {
+        background: #b45309;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>Real-time Face Attendance (Backend Matching)</h3>
+
+    <div class="camera-wrap">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div id="status">Initializing…</div>
+    <!-- <div class="small">
+      Models must be in <code>/public/models</code> and loaded from
+      <code>/models</code>. -->
+    </div>
+    <div id="log"></div>
+    <div id="toast" role="status" aria-live="polite"></div>
+
+    <script>
+      (async function () {
+        const video = document.getElementById("video");
+        const overlay = document.getElementById("overlay");
+        const statusEl = document.getElementById("status");
+        const logEl = document.getElementById("log");
+        const toastEl = document.getElementById("toast");
+
+        const socket = typeof io !== "undefined" ? io() : null;
+
+        /* ---------------- CONFIG ---------------- */
+        const STRICT_MATCH = 0.44; // server should match this
+        const STABLE_FRAMES = 3; // frames required before sending
+        const BUFFER_MAX = 8; // rolling descriptor buffer
+        const ATTENDANCE_DEBOUNCE_MS = 5000; // avoid double mark
+        const MAX_BOX_MOVE = 30; // px
+
+        /* ---------------- STATE ---------------- */
+        let lastMarkAt = 0;
+        let buffer = []; // {desc, box}
+
+        /* ---------------- UI helpers ---------------- */
+        function log(...args) {
+          console.log(...args);
+          logEl.textContent +=
+            args
+              .map((a) =>
+                typeof a === "object" ? JSON.stringify(a) : String(a),
+              )
+              .join(" ") + "\n";
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function showToast(msg, cls = "info", ms = 2500) {
+          toastEl.className = "";
+          toastEl.textContent = msg;
+          toastEl.classList.add("show", cls);
+          clearTimeout(window.__t);
+          window.__t = setTimeout(() => (toastEl.className = ""), ms);
+        }
+
+        function ensureCanvas() {
+          if (!video.videoWidth) return;
+          if (overlay.width !== video.videoWidth) {
+            overlay.width = video.videoWidth;
+            overlay.height = video.videoHeight;
+          }
+        }
+
+        function drawBox(box, label, color = "#22c55e") {
+          const ctx = overlay.getContext("2d");
+          ctx.clearRect(0, 0, overlay.width, overlay.height);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 3;
+          ctx.strokeRect(box.x, box.y, box.width, box.height);
+          if (label) {
+            ctx.font = "16px sans-serif";
+            const w = ctx.measureText(label).width + 8;
+            ctx.fillStyle = color;
+            ctx.fillRect(box.x, box.y - 22, w, 20);
+            ctx.fillStyle = "#fff";
+            ctx.fillText(label, box.x + 4, box.y - 7);
+          }
+        }
+
+        function euclidean(a, b) {
+          let s = 0;
+          for (let i = 0; i < a.length; i++) {
+            const d = a[i] - b[i];
+            s += d * d;
+          }
+          return Math.sqrt(s);
+        }
+
+        function meanDescriptor(arr) {
+          const out = new Float32Array(arr[0].length);
+          arr.forEach((d) => {
+            for (let i = 0; i < d.length; i++) out[i] += d[i];
+          });
+          for (let i = 0; i < out.length; i++) out[i] /= arr.length;
+          return out;
+        }
+
+        function maxMove(boxes) {
+          const r = boxes[0];
+          let m = 0;
+          boxes.forEach((b) => {
+            m = Math.max(m, Math.abs(b.x - r.x), Math.abs(b.y - r.y));
+          });
+          return m;
+        }
+
+        /* ---------------- MAIN LOOP ---------------- */
+        async function loop() {
+          try {
+            const opt = new faceapi.TinyFaceDetectorOptions({ inputSize: 320 });
+            const res = await faceapi
+              .detectSingleFace(video, opt)
+              .withFaceLandmarks()
+              .withFaceDescriptor();
+            ensureCanvas();
+
+            if (!res) {
+              overlay
+                .getContext("2d")
+                .clearRect(0, 0, overlay.width, overlay.height);
+              statusEl.textContent = "No face";
+              buffer = [];
+              return requestAnimationFrame(loop);
+            }
+
+            const box = res.detection.box;
+            const desc = new Float32Array(res.descriptor);
+            buffer.push({ desc, box });
+            if (buffer.length > BUFFER_MAX) buffer.shift();
+
+            drawBox(box, "Detecting…", "#2563eb");
+            statusEl.textContent = "Detecting…";
+
+            if (buffer.length >= STABLE_FRAMES) {
+              const win = buffer.slice(-STABLE_FRAMES);
+              if (maxMove(win.map((w) => w.box)) <= MAX_BOX_MOVE) {
+                const mean = meanDescriptor(win.map((w) => w.desc));
+
+                if (
+                  !lastMarkAt ||
+                  Date.now() - lastMarkAt > ATTENDANCE_DEBOUNCE_MS
+                ) {
+                  lastMarkAt = Date.now();
+
+                  socket.emit(
+                    "face:verify",
+                    { descriptor: Array.from(mean) },
+                    (ack) => {
+                      if (!ack || !ack.ok) {
+                        log("verify err", ack);
+                        return;
+                      }
+
+                      if (ack.match) {
+                        drawBox(box, `${ack.user.name} ✓`, "#22c55e");
+                        statusEl.textContent = `Matched ${ack.user.name}`;
+
+                        // socket.emit('attendance:mark', {
+                        //   userId: ack.user._id,
+                        //   confidence: ack.confidence
+                        // }, (a)=>{
+                        //   if (a && a.ok){
+                        //     showToast(`${ack.user.name} attendance recorded`,'success');
+                        //   }
+                        // });
+
+                        socket.emit(
+                          "attendance:mark",
+                          {
+                            userId: ack.user._id,
+                            confidence: ack.confidence,
+                          },
+                          (a) => {
+                            if (!a || !a.ok) return;
+
+                            if (a.action === "created") {
+                              showToast(
+                                `${ack.user.name} attendance recorded`,
+                                "success",
+                              );
+                            }
+
+                            if (a.action === "skipped") {
+                              showToast(
+                                `${ack.user.name} already marked (within 3 hours)`,
+                                "warn",
+                                4000,
+                              );
+                            }
+                          },
+                        );
+                      } else {
+                        drawBox(box, "Unknown", "#f59e0b");
+                        statusEl.textContent = "Unknown face";
+
+                        // auto-enroll as new user
+                        socket.emit(
+                          "attendance:mark",
+                          {
+                            descriptors: [Array.from(mean)],
+                          },
+                          (a) => {
+                            if (!a || !a.ok) return;
+
+                            const nm = a.user?.name || "New user";
+
+                            if (a.action === "created") {
+                              showToast(
+                                `${nm} enrolled & marked`,
+                                "info",
+                                3000,
+                              );
+                            }
+
+                            if (a.action === "skipped") {
+                              showToast(
+                                `${nm} already marked (within 3 hours)`,
+                                "warn",
+                                4000,
+                              );
+                            }
+                          },
+                        );
+                      }
+                    },
+                  );
+                }
+              }
+            }
+          } catch (e) {
+            console.warn(e);
+          } finally {
+            requestAnimationFrame(loop);
+          }
+        }
+
+        /* ---------------- STARTUP ---------------- */
+        try {
+          statusEl.textContent = "Loading models…";
+
+          await faceapi.nets.tinyFaceDetector.loadFromUri("/models");
+          await faceapi.nets.faceLandmark68Net.loadFromUri("/models");
+          await faceapi.nets.faceRecognitionNet.loadFromUri("/models");
+
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+          });
+          video.srcObject = stream;
+          await new Promise((r) => (video.onloadedmetadata = r));
+
+          statusEl.textContent = "Ready";
+          loop();
+
+          socket.on("attendance:new", (p) => {
+            const n = p.attendance?.user?.name || "User";
+            showToast(`${n} attendance broadcast`, "info");
+          });
+        } catch (err) {
+          log("startup error", err);
+          showToast("Startup failed", "warn", 4000);
+        }
+      })();
+    </script>
+  </body>
+</html>
